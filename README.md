@@ -155,6 +155,8 @@ python3 python_strategy_demo.py
 
 The strategy sandbox looks for the asset paths defined near the top of `python_strategy_demo.py`. If no image is present, the script drops in simple placeholder BMPs so you can replace them with your own artwork later.
 
+- Controls: `WASD` pans the camera, `=` / `-` (or keypad ±) zoom in/out, left-click selects units, right-click issues move orders.
+
 ### Rebuilding after C/C++ edits
 
 - After editing any C source or headers, rebuild with `cmake --build build` (or `ninja -C build`). This recompiles only the targets that changed—no need to rerun `cmake` unless you touch `CMakeLists.txt` or change build options.

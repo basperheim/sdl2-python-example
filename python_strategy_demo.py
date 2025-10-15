@@ -1,4 +1,5 @@
 import ctypes
+import math
 import os
 import sys
 import time
@@ -39,7 +40,17 @@ class HL_TileInstance(ctypes.Structure):
                 ("r", ctypes.c_int32),
                 ("terrain_tex", ctypes.c_int32),
                 ("unit_tex", ctypes.c_int32),
-                ("overlay", HL_Color)]
+                ("terrain_scale", ctypes.c_float),
+                ("unit_scale", ctypes.c_float),
+                ("overlay", HL_Color),
+                ("offset_x", ctypes.c_float),
+                ("offset_y", ctypes.c_float)]
+
+
+class HL_DebugLabel(ctypes.Structure):
+    _fields_ = [("q", ctypes.c_int32),
+                ("r", ctypes.c_int32),
+                ("text", ctypes.c_char * 16)]
 
 
 # Configure lib prototypes
@@ -64,10 +75,18 @@ lib.hl_step.argtypes = [ctypes.c_float]
 lib.hl_step.restype = None
 lib.hl_poll_event.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int)]
 lib.hl_poll_event.restype = ctypes.c_int
+lib.hl_query_texture.argtypes = [ctypes.c_int, ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int)]
+lib.hl_query_texture.restype = ctypes.c_int
+lib.hl_set_camera.argtypes = [ctypes.c_float, ctypes.c_float, ctypes.c_float]
+lib.hl_set_camera.restype = None
+lib.hl_set_debug_labels.argtypes = [ctypes.POINTER(HL_DebugLabel), ctypes.c_int]
+lib.hl_set_debug_labels.restype = None
 
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ASSET_DIR = os.path.join(BASE_DIR, "assets")
+WINDOW_WIDTH = 1280
+WINDOW_HEIGHT = 800
 
 
 TERRAIN_DEFS = [
@@ -76,24 +95,27 @@ TERRAIN_DEFS = [
         "slot": 0,
         "path": "assets/terrain_grass.png",
         "placeholder": (70, 145, 84),
-        "overlay": (64, 140, 82, 40),
+        "overlay": (0, 0, 0, 0),
         "passable": True,
+        "scale": 1.0,
     },
     {
         "name": "water",
         "slot": 1,
         "path": "assets/terrain_water.png",
         "placeholder": (58, 105, 190),
-        "overlay": (70, 110, 200, 70),
+        "overlay": (0, 0, 0, 0),
         "passable": False,
+        "scale": 1.0,
     },
     {
         "name": "mountain",
         "slot": 2,
         "path": "assets/terrain_mountain.png",
         "placeholder": (145, 141, 132),
-        "overlay": (140, 135, 125, 60),
+        "overlay": (0, 0, 0, 0),
         "passable": False,
+        "scale": 1.0,
     },
 ]
 
@@ -105,11 +127,21 @@ UNIT_DEFS = [
         "path": "assets/unit_scout.png",
         "placeholder": (220, 220, 80),
         "move_range": 3,
+        "scale": 0.7,
     }
 ]
 
 
 HEX_DIRECTIONS = [(1, 0), (1, -1), (0, -1), (-1, 0), (-1, 1), (0, 1)]
+
+SDLK_W = ord("w")
+SDLK_A = ord("a")
+SDLK_S = ord("s")
+SDLK_D = ord("d")
+SDLK_MINUS = 45           # '-'
+SDLK_EQUALS = 61          # '='
+SDLK_KP_MINUS = 1073741910
+SDLK_KP_PLUS = 1073741911
 
 
 def ensure_placeholder_image(path, rgb, size=96):
@@ -184,7 +216,7 @@ def hex_distance(a, b):
 
 
 class TerrainType:
-    def __init__(self, name, slot, rel_path, placeholder_rgb, overlay_rgba, passable):
+    def __init__(self, name, slot, rel_path, placeholder_rgb, overlay_rgba, passable, scale):
         self.name = name
         self.slot = slot
         self.rel_path = rel_path
@@ -192,6 +224,9 @@ class TerrainType:
         self.overlay_rgba = overlay_rgba
         self.passable = passable
         self.loaded = False
+        self.scale = scale
+        self.pixel_width = 0
+        self.pixel_height = 0
 
     def ensure_texture(self):
         path = resolve_path(self.rel_path)
@@ -200,20 +235,27 @@ class TerrainType:
         self.loaded = bool(ok)
         if not self.loaded:
             print(f"[terrain] Texture load failed for {self.name}: {path}")
-        return self.loaded
+            return False
+        width = ctypes.c_int(0)
+        height = ctypes.c_int(0)
+        if lib.hl_query_texture(self.slot, ctypes.byref(width), ctypes.byref(height)):
+            self.pixel_width = width.value
+            self.pixel_height = height.value
+        return True
 
     def base_overlay(self):
         return make_color(*self.overlay_rgba)
 
 
 class UnitType:
-    def __init__(self, name, slot, rel_path, placeholder_rgb, move_range):
+    def __init__(self, name, slot, rel_path, placeholder_rgb, move_range, scale):
         self.name = name
         self.slot = slot
         self.rel_path = rel_path
         self.placeholder_rgb = placeholder_rgb
         self.move_range = move_range
         self.loaded = False
+        self.scale = scale
 
     def ensure_texture(self):
         path = resolve_path(self.rel_path)
@@ -222,7 +264,8 @@ class UnitType:
         self.loaded = bool(ok)
         if not self.loaded:
             print(f"[unit] Texture load failed for {self.name}: {path}")
-        return self.loaded
+            return False
+        return True
 
 
 class Tile:
@@ -266,17 +309,32 @@ class HexStrategyGame:
         self.hover_hex = None
         self.running = True
         self.hex_radius = 5
-        self.hex_size = 38.0
+        self.hex_size = 48.0
+        self.camera_offset = [0.0, 0.0]
+        self.camera_zoom = 1.0
+        self.keys_down = set()
+        self.pan_speed = 320.0  # pixels per second, before zoom scaling
+        self.min_zoom = 0.4
+        self.max_zoom = 3.5
+        self.time_accum = 0.0
 
     def initialize(self):
         os.makedirs(ASSET_DIR, exist_ok=True)
         self._bootstrap_types()
         self._load_textures()
+        self._configure_hex_size()
         self._build_world()
         self._spawn_units()
         grid_extent = self.hex_radius * 2 + 1
+        rows = cols = grid_extent
+        grid_w = (1.5 * (cols - 1) * self.hex_size) + 2.0 * self.hex_size
+        grid_h = (math.sqrt(3.0) * self.hex_size * (rows + 0.5)) + self.hex_size
+        fit_zoom = min(1.0, WINDOW_WIDTH / grid_w, WINDOW_HEIGHT / grid_h)
+        self.camera_zoom = max(self.min_zoom, min(self.max_zoom, fit_zoom))
+        self.camera_offset = [0.0, 0.0]
         lib.hl_set_grid(grid_extent, grid_extent, ctypes.c_float(self.hex_size), 1)
         lib.hl_set_clear_color(18, 20, 26, 255)
+        self.sync_camera()
 
     def _bootstrap_types(self):
         for entry in TERRAIN_DEFS:
@@ -287,6 +345,7 @@ class HexStrategyGame:
                 entry["placeholder"],
                 entry["overlay"],
                 entry["passable"],
+                entry.get("scale", 1.0),
             )
             self.terrain_types[terrain.name] = terrain
         for entry in UNIT_DEFS:
@@ -296,6 +355,7 @@ class HexStrategyGame:
                 entry["path"],
                 entry["placeholder"],
                 entry["move_range"],
+                entry.get("scale", 0.7),
             )
             self.unit_types[unit.name] = unit
 
@@ -304,6 +364,46 @@ class HexStrategyGame:
             terrain.ensure_texture()
         for unit_type in self.unit_types.values():
             unit_type.ensure_texture()
+
+    def _configure_hex_size(self):
+        base = self.terrain_types.get("grass")
+        if base and base.pixel_width and base.pixel_height:
+            effective_width = base.pixel_width * base.scale
+            effective_height = base.pixel_height * base.scale
+            size_from_width = effective_width * 0.5
+            size_from_height = effective_height / math.sqrt(3.0)
+            size = min(size_from_width, size_from_height)
+            self.hex_size = max(32.0, size)
+        else:
+            self.hex_size = max(self.hex_size, 32.0)
+
+    def sync_camera(self):
+        lib.hl_set_camera(
+            ctypes.c_float(self.camera_offset[0]),
+            ctypes.c_float(self.camera_offset[1]),
+            ctypes.c_float(self.camera_zoom),
+        )
+
+    def update(self, dt):
+        if dt > 0.0:
+            self.time_accum += dt
+
+    def update_camera(self, dt):
+        move_delta = 0.0
+        if dt > 0.0:
+            move_delta = self.pan_speed * dt / max(self.camera_zoom, 0.2)
+
+        if SDLK_W in self.keys_down:
+            self.camera_offset[1] += move_delta
+        if SDLK_S in self.keys_down:
+            self.camera_offset[1] -= move_delta
+        if SDLK_A in self.keys_down:
+            self.camera_offset[0] += move_delta
+        if SDLK_D in self.keys_down:
+            self.camera_offset[0] -= move_delta
+
+        self.camera_zoom = max(self.min_zoom, min(self.max_zoom, self.camera_zoom))
+        self.sync_camera()
 
     def _build_world(self):
         rng = random_from_seed(42)
@@ -357,6 +457,10 @@ class HexStrategyGame:
             self._handle_right_click(q, r)
         elif ev == 3:
             self._handle_hover(q, r)
+        elif ev == 5:
+            self._handle_key_down(q)
+        elif ev == 6:
+            self._handle_key_up(q)
 
     def _handle_left_click(self, q, r):
         tile = self.tiles.get((q, r))
@@ -388,6 +492,16 @@ class HexStrategyGame:
             self.hover_hex = (q, r)
         else:
             self.hover_hex = None
+
+    def _handle_key_down(self, key):
+        self.keys_down.add(key)
+        if key in (SDLK_MINUS, SDLK_KP_MINUS):
+            self.camera_zoom *= 0.9
+        elif key in (SDLK_EQUALS, SDLK_KP_PLUS):
+            self.camera_zoom *= 1.1
+
+    def _handle_key_up(self, key):
+        self.keys_down.discard(key)
 
     def _move_unit(self, unit, target_tile):
         origin_tile = self.tiles[(unit.q, unit.r)]
@@ -422,16 +536,51 @@ class HexStrategyGame:
 
     def push_tiles(self):
         instances = []
+        labels = []
+        tile_index = 0
         for (q, r), tile in self.tiles.items():
             terrain_slot = tile.terrain.slot if tile.terrain.loaded else -1
             unit_slot = tile.unit.texture_slot if tile.unit else -1
+            terrain_scale = float(tile.terrain.scale if tile.terrain else 1.0)
+            unit_scale = float(tile.unit.unit_type.scale if tile.unit else 1.0)
             overlay = self._overlay_for_tile(tile)
-            instances.append(HL_TileInstance(q, r, terrain_slot, unit_slot, overlay))
+            offset_x = 0.0
+            offset_y = 0.0
+            if tile.terrain.name == "water":
+                offset_y = math.sin(self.time_accum + q * 0.35 + r * 0.21) * 3.0
+            elif (q + r) % 4 == 0:
+                offset_x = 2.0
+
+            inst = HL_TileInstance()
+            inst.q = q
+            inst.r = r
+            inst.terrain_tex = terrain_slot
+            inst.unit_tex = unit_slot
+            inst.terrain_scale = terrain_scale
+            inst.unit_scale = unit_scale
+            inst.overlay = overlay
+            inst.offset_x = offset_x
+            inst.offset_y = offset_y
+            instances.append(inst)
+            if tile_index % 5 == 0:
+                label_text = f"{q},{r}".encode("ascii", "replace")[:15]
+                label_struct = HL_DebugLabel()
+                label_struct.q = q
+                label_struct.r = r
+                label_struct.text = (label_text + b"\0" * 16)[:16]
+                labels.append(label_struct)
+            tile_index += 1
         if not instances:
             lib.hl_clear_tiles()
+            lib.hl_set_debug_labels(None, 0)
             return
         arr_type = HL_TileInstance * len(instances)
         lib.hl_set_tiles(arr_type(*instances), len(instances))
+        if labels:
+            label_arr_type = HL_DebugLabel * len(labels)
+            lib.hl_set_debug_labels(label_arr_type(*labels), len(labels))
+        else:
+            lib.hl_set_debug_labels(None, 0)
 
     def _overlay_for_tile(self, tile):
         base = tile.terrain.base_overlay()
@@ -457,7 +606,7 @@ def random_from_seed(seed):
 
 
 def main():
-    if not lib.hl_init(1280, 800, b"Hex Strategy Demo"):
+    if not lib.hl_init(WINDOW_WIDTH, WINDOW_HEIGHT, b"Hex Strategy Demo"):
         raise RuntimeError("Failed to initialize SDL2/hexlib")
 
     game = HexStrategyGame()
@@ -479,6 +628,8 @@ def main():
             dt = now - last_time
             last_time = now
 
+            game.update(dt)
+            game.update_camera(dt)
             game.push_tiles()
             lib.hl_step(ctypes.c_float(dt))
             time.sleep(0.004)
