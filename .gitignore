@@ -1,3 +1,6 @@
+# macOS Files
+*.DS_Store
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
@@ -5,6 +8,21 @@ __pycache__/
 
 # C extensions
 *.so
+*.dylib
+*.dll
+*.a
+*.o
+*.obj
+*.lib
+
+# CMake/Ninja build output (in case out-of-tree builds are used)
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+rules.ninja
+build.ninja
+compile_commands.json
 
 # Distribution / packaging
 .Python
@@ -182,9 +200,9 @@ cython_debug/
 .abstra/
 
 # Visual Studio Code
-#  Visual Studio Code specific template is maintained in a separate VisualStudioCode.gitignore 
+#  Visual Studio Code specific template is maintained in a separate VisualStudioCode.gitignore
 #  that can be found at https://github.com/github/gitignore/blob/main/Global/VisualStudioCode.gitignore
-#  and can be added to the global gitignore or merged into this file. However, if you prefer, 
+#  and can be added to the global gitignore or merged into this file. However, if you prefer,
 #  you could uncomment the following to ignore the entire vscode folder
 # .vscode/
 
