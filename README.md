@@ -148,7 +148,19 @@ ninja
 # Python-controlled renderer
 cd ..
 python3 python_demo.py
+
+# Hex strategy sandbox (texture-rendered)
+python3 python_strategy_demo.py
 ```
+
+The strategy sandbox looks for the asset paths defined near the top of `python_strategy_demo.py`. If no image is present, the script drops in simple placeholder BMPs so you can replace them with your own artwork later.
+
+### Rebuilding after C/C++ edits
+
+- After editing any C source or headers, rebuild with `cmake --build build` (or `ninja -C build`). This recompiles only the targets that changed—no need to rerun `cmake` unless you touch `CMakeLists.txt` or change build options.
+- To rebuild just the shared library that Python loads: `cmake --build build --target hexlib` (or `ninja -C build libhexlib.dylib`).
+- To rebuild the standalone demo executable: `cmake --build build --target hex_demo`.
+- If you ever delete the `build/` directory, recreate it and reconfigure with `cmake -S . -B build` before building again.
 
 > On macOS, you can be explicit about the SDK if needed:
 > `cmake -G Ninja -D CMAKE_OSX_SYSROOT="$(xcrun --show-sdk-path)" ..`
