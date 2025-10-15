@@ -1,5 +1,6 @@
 #define SDL_DISABLE_IMMINTRIN_H 1
 #include <SDL.h>
+#include <SDL_image.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
@@ -13,12 +14,22 @@ typedef struct {
     float origin_y;
 } HL_Grid;
 
-static SDL_Window*   g_window = NULL;
-static SDL_Renderer* g_renderer = NULL;
-static HL_Grid       g_grid = {0};
+static SDL_Window*     g_window = NULL;
+static SDL_Renderer*   g_renderer = NULL;
+static HL_Grid         g_grid = {0};
 static HL_HexInstance* g_instances = NULL;
-static int           g_instance_count = 0;
-static SDL_Color     g_clear = { 12, 12, 16, 255 }; // default dark
+static int             g_instance_count = 0;
+static SDL_Color       g_clear = { 12, 12, 16, 255 }; // default dark
+
+typedef struct {
+    SDL_Texture* texture;
+    int w;
+    int h;
+} HL_TextureSlot;
+
+static HL_TextureSlot  g_textures[HL_MAX_TEXTURE_SLOTS] = {0};
+static HL_TileInstance* g_tiles = NULL;
+static int             g_tile_count = 0;
 
 // --- Math for axial coords (flat-top) ---
 // Reference: https://www.redblobgames.com/grids/hex-grids/
@@ -105,13 +116,22 @@ HEXLIB_API int hl_init(int width, int height, const char* title) {
         return 0;
     }
     SDL_SetRenderDrawBlendMode(g_renderer, SDL_BLENDMODE_BLEND);
+
+    int img_flags = IMG_INIT_PNG | IMG_INIT_JPG;
+    int img_init = IMG_Init(img_flags);
+    if ((img_init & img_flags) != img_flags) {
+        SDL_Log("IMG_Init warning: %s", IMG_GetError());
+    }
     return 1;
 }
 
 HEXLIB_API void hl_shutdown(void) {
+    hl_clear_tiles();
+    hl_clear_textures();
     if (g_instances) { free(g_instances); g_instances = NULL; g_instance_count = 0; }
     if (g_renderer) { SDL_DestroyRenderer(g_renderer); g_renderer = NULL; }
     if (g_window)   { SDL_DestroyWindow(g_window); g_window = NULL; }
+    IMG_Quit();
     SDL_Quit();
 }
 
@@ -131,12 +151,79 @@ HEXLIB_API void hl_set_grid(int rows, int cols, float hex_size, int flat_top) {
 }
 
 HEXLIB_API void hl_set_instances(const HL_HexInstance* instances, int count) {
+    if (g_tiles) { free(g_tiles); g_tiles = NULL; g_tile_count = 0; }
     if (g_instances) { free(g_instances); g_instances = NULL; g_instance_count = 0; }
     if (count <= 0 || !instances) return;
     g_instances = (HL_HexInstance*)malloc(sizeof(HL_HexInstance) * count);
     if (!g_instances) return;
     memcpy(g_instances, instances, sizeof(HL_HexInstance) * count);
     g_instance_count = count;
+}
+
+static void destroy_texture_slot(int slot) {
+    if (slot < 0 || slot >= HL_MAX_TEXTURE_SLOTS) return;
+    if (g_textures[slot].texture) {
+        SDL_DestroyTexture(g_textures[slot].texture);
+        g_textures[slot].texture = NULL;
+    }
+    g_textures[slot].w = 0;
+    g_textures[slot].h = 0;
+}
+
+HEXLIB_API int hl_load_texture(int slot, const char* path) {
+    if (!g_renderer || !path) return 0;
+    if (slot < 0 || slot >= HL_MAX_TEXTURE_SLOTS) return 0;
+
+    destroy_texture_slot(slot);
+
+    SDL_Surface* surf = IMG_Load(path);
+    if (!surf) {
+        SDL_Log("IMG_Load failed for '%s': %s", path, IMG_GetError());
+        surf = SDL_LoadBMP(path);
+        if (!surf) {
+            SDL_Log("SDL_LoadBMP fallback failed for '%s': %s", path, SDL_GetError());
+            return 0;
+        }
+    }
+
+    SDL_Texture* tex = SDL_CreateTextureFromSurface(g_renderer, surf);
+    if (!tex) {
+        SDL_Log("SDL_CreateTextureFromSurface failed for '%s': %s", path, SDL_GetError());
+        SDL_FreeSurface(surf);
+        return 0;
+    }
+
+    SDL_SetTextureBlendMode(tex, SDL_BLENDMODE_BLEND);
+    g_textures[slot].texture = tex;
+    g_textures[slot].w = surf->w;
+    g_textures[slot].h = surf->h;
+    SDL_FreeSurface(surf);
+    return 1;
+}
+
+HEXLIB_API void hl_unload_texture(int slot) {
+    destroy_texture_slot(slot);
+}
+
+HEXLIB_API void hl_clear_textures(void) {
+    for (int i = 0; i < HL_MAX_TEXTURE_SLOTS; ++i) {
+        destroy_texture_slot(i);
+    }
+}
+
+HEXLIB_API void hl_set_tiles(const HL_TileInstance* tiles, int count) {
+    if (g_instances) { free(g_instances); g_instances = NULL; g_instance_count = 0; }
+    if (g_tiles) { free(g_tiles); g_tiles = NULL; g_tile_count = 0; }
+    if (count <= 0 || !tiles) return;
+    g_tiles = (HL_TileInstance*)malloc(sizeof(HL_TileInstance) * count);
+    if (!g_tiles) return;
+    memcpy(g_tiles, tiles, sizeof(HL_TileInstance) * count);
+    g_tile_count = count;
+}
+
+HEXLIB_API void hl_clear_tiles(void) {
+    if (g_tiles) { free(g_tiles); g_tiles = NULL; }
+    g_tile_count = 0;
 }
 
 HEXLIB_API void hl_set_clear_color(uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
@@ -187,12 +274,54 @@ HEXLIB_API void hl_step(float dt_seconds) {
     SDL_SetRenderDrawColor(g_renderer, g_clear.r, g_clear.g, g_clear.b, g_clear.a);
     SDL_RenderClear(g_renderer);
 
-    // Draw instances
-    for (int i = 0; i < g_instance_count; ++i) {
-        float cx, cy;
-        axial_to_pixel_flat(g_instances[i].q, g_instances[i].r, g_grid.size, &cx, &cy);
-        SDL_Color c = { g_instances[i].color.r, g_instances[i].color.g, g_instances[i].color.b, g_instances[i].color.a };
-        draw_hex_filled(cx, cy, g_grid.size, c);
+    if (g_tile_count > 0) {
+        float hex_width = g_grid.size * 2.0f;
+        float hex_height = sqrtf(3.0f) * g_grid.size;
+        for (int i = 0; i < g_tile_count; ++i) {
+            const HL_TileInstance* tile = &g_tiles[i];
+            float cx, cy;
+            axial_to_pixel_flat(tile->q, tile->r, g_grid.size, &cx, &cy);
+
+            SDL_Texture* terrain = NULL;
+            if (tile->terrain_tex >= 0 && tile->terrain_tex < HL_MAX_TEXTURE_SLOTS) {
+                terrain = g_textures[tile->terrain_tex].texture;
+            }
+            if (terrain) {
+                SDL_FRect dest = { cx - hex_width * 0.5f, cy - hex_height * 0.5f, hex_width, hex_height };
+                SDL_RenderCopyF(g_renderer, terrain, NULL, &dest);
+            } else {
+                SDL_Color fallback = { 70, 90, 110, 255 };
+                draw_hex_filled(cx, cy, g_grid.size, fallback);
+            }
+
+            if (tile->overlay.a > 0) {
+                SDL_Color overlay = { tile->overlay.r, tile->overlay.g, tile->overlay.b, tile->overlay.a };
+                draw_hex_filled(cx, cy, g_grid.size, overlay);
+            }
+
+            SDL_Texture* unit = NULL;
+            if (tile->unit_tex >= 0 && tile->unit_tex < HL_MAX_TEXTURE_SLOTS) {
+                unit = g_textures[tile->unit_tex].texture;
+            }
+            if (unit) {
+                float unit_scale = 0.7f;
+                SDL_FRect dest = {
+                    cx - (hex_width * unit_scale * 0.5f),
+                    cy - (hex_height * unit_scale * 0.5f),
+                    hex_width * unit_scale,
+                    hex_height * unit_scale
+                };
+                SDL_RenderCopyF(g_renderer, unit, NULL, &dest);
+            }
+        }
+    } else {
+        // Draw color-only instances (legacy path)
+        for (int i = 0; i < g_instance_count; ++i) {
+            float cx, cy;
+            axial_to_pixel_flat(g_instances[i].q, g_instances[i].r, g_grid.size, &cx, &cy);
+            SDL_Color c = { g_instances[i].color.r, g_instances[i].color.g, g_instances[i].color.b, g_instances[i].color.a };
+            draw_hex_filled(cx, cy, g_grid.size, c);
+        }
     }
 
     SDL_RenderPresent(g_renderer);
@@ -209,7 +338,13 @@ HEXLIB_API int hl_poll_event(int* out_q, int* out_r) {
                 pixel_to_axial_flat((float)mx, (float)my, g_grid.size, &q, &r);
                 if (out_q) *out_q = q;
                 if (out_r) *out_r = r;
-                return 2;
+                if (e.button.button == SDL_BUTTON_RIGHT) {
+                    return 4;
+                }
+                if (e.button.button == SDL_BUTTON_LEFT) {
+                    return 2;
+                }
+                break;
             }
             case SDL_MOUSEMOTION: {
                 int mx = e.motion.x, my = e.motion.y;
