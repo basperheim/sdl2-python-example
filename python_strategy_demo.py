@@ -7,6 +7,12 @@ from collections import deque
 
 
 def _load_lib():
+    """Locate and load the hexlib shared library that the Python side drives.
+
+    We try platform-specific locations inside the repo first (build tree and
+    project root). If that fails, fall back to the platform's shared library
+    resolution rules so a system-installed copy can still be picked up.
+    """
     here = os.path.dirname(os.path.abspath(__file__))
     candidates = []
     if sys.platform == "darwin":
@@ -25,10 +31,13 @@ def _load_lib():
     return ctypes.CDLL("hexlib" + suffix)
 
 
+# Load the native renderer once; every subsequent call into hexlib uses this handle.
 lib = _load_lib()
 
 
 class HL_Color(ctypes.Structure):
+    """ctypes mirror of the hexlib RGBA colour struct (8-bit channels)."""
+
     _fields_ = [("r", ctypes.c_uint8),
                 ("g", ctypes.c_uint8),
                 ("b", ctypes.c_uint8),
@@ -36,24 +45,28 @@ class HL_Color(ctypes.Structure):
 
 
 class HL_TileInstance(ctypes.Structure):
-    _fields_ = [("q", ctypes.c_int32),
-                ("r", ctypes.c_int32),
-                ("terrain_tex", ctypes.c_int32),
-                ("unit_tex", ctypes.c_int32),
-                ("terrain_scale", ctypes.c_float),
-                ("unit_scale", ctypes.c_float),
-                ("overlay", HL_Color),
-                ("offset_x", ctypes.c_float),
+    """Struct describing one tile render request we send to hexlib each frame."""
+
+    _fields_ = [("q", ctypes.c_int32),          # axial q coordinate
+                ("r", ctypes.c_int32),          # axial r coordinate
+                ("terrain_tex", ctypes.c_int32),  # texture slot index for terrain (-1 = none)
+                ("unit_tex", ctypes.c_int32),     # texture slot index for unit sprite (-1 = none)
+                ("terrain_scale", ctypes.c_float),  # scale multiplier for terrain blit
+                ("unit_scale", ctypes.c_float),     # scale multiplier for unit blit
+                ("overlay", HL_Color),             # overlay tint rendered above terrain/unit
+                ("offset_x", ctypes.c_float),      # pixel offset applied after projection
                 ("offset_y", ctypes.c_float)]
 
 
 class HL_DebugLabel(ctypes.Structure):
+    """Tiny bitmap label (q,r,text) to help debug layout in the renderer."""
+
     _fields_ = [("q", ctypes.c_int32),
                 ("r", ctypes.c_int32),
                 ("text", ctypes.c_char * 16)]
 
 
-# Configure lib prototypes
+# Configure lib prototypes so ctypes knows the argument/return layout for each C function.
 lib.hl_init.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_char_p]
 lib.hl_init.restype = ctypes.c_int
 lib.hl_shutdown.argtypes = []
@@ -83,12 +96,14 @@ lib.hl_set_debug_labels.argtypes = [ctypes.POINTER(HL_DebugLabel), ctypes.c_int]
 lib.hl_set_debug_labels.restype = None
 
 
+# Paths and window defaults used throughout the script.
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ASSET_DIR = os.path.join(BASE_DIR, "assets")
 WINDOW_WIDTH = 1280
 WINDOW_HEIGHT = 800
 
 
+# Declarative terrain configuration; each dict is converted into a TerrainType.
 TERRAIN_DEFS = [
     {
         "name": "grass",
@@ -120,6 +135,7 @@ TERRAIN_DEFS = [
 ]
 
 
+# Unit blueprints mirror terrain definitions and become UnitType objects.
 UNIT_DEFS = [
     {
         "name": "scout",
@@ -127,13 +143,15 @@ UNIT_DEFS = [
         "path": "assets/unit_scout.png",
         "placeholder": (220, 220, 80),
         "move_range": 3,
-        "scale": 0.7,
+        "scale": 0.05,
     }
 ]
 
 
+# Axial direction vectors (flat-top layout) used for neighbor traversal.
 HEX_DIRECTIONS = [(1, 0), (1, -1), (0, -1), (-1, 0), (-1, 1), (0, 1)]
 
+# Keyboard constants we care about (SDL keycodes).
 SDLK_W = ord("w")
 SDLK_A = ord("a")
 SDLK_S = ord("s")
@@ -145,6 +163,7 @@ SDLK_KP_PLUS = 1073741911
 
 
 def ensure_placeholder_image(path, rgb, size=96):
+    """Generate a fallback BMP if the expected asset is missing."""
     if rgb is None:
         return
     if os.path.exists(path):
@@ -154,6 +173,7 @@ def ensure_placeholder_image(path, rgb, size=96):
 
 
 def write_solid_bmp(path, rgb, size=96):
+    """Minimal 32-bit BMP writer used to craft placeholder textures on the fly."""
     r, g, b = rgb
     a = 255
     width = height = size
@@ -187,12 +207,14 @@ def write_solid_bmp(path, rgb, size=96):
 
 
 def resolve_path(rel_path):
+    """Normalise an asset path so both absolute and relative entries work."""
     if os.path.isabs(rel_path):
         return rel_path
     return os.path.join(BASE_DIR, rel_path)
 
 
 def make_color(r, g, b, a=255):
+    """Clamp and pack RGBA components into an HL_Color struct."""
     r = max(0, min(255, int(r)))
     g = max(0, min(255, int(g)))
     b = max(0, min(255, int(b)))
@@ -201,11 +223,13 @@ def make_color(r, g, b, a=255):
 
 
 def axial_neighbors(q, r):
+    """Yield the six neighboring axial coordinates around (q, r)."""
     for dq, dr in HEX_DIRECTIONS:
         yield q + dq, r + dr
 
 
 def hex_distance(a, b):
+    """Return the axial distance (in moves) between two hex coordinates."""
     aq, ar = a
     bq, br = b
     ax, az = aq, ar
@@ -216,6 +240,8 @@ def hex_distance(a, b):
 
 
 class TerrainType:
+    """Runtime wrapper for terrain metadata and texture bookkeeping."""
+
     def __init__(self, name, slot, rel_path, placeholder_rgb, overlay_rgba, passable, scale):
         self.name = name
         self.slot = slot
@@ -248,6 +274,8 @@ class TerrainType:
 
 
 class UnitType:
+    """Holds shared data for a given unit archetype (textures, stats)."""
+
     def __init__(self, name, slot, rel_path, placeholder_rgb, move_range, scale):
         self.name = name
         self.slot = slot
@@ -269,6 +297,8 @@ class UnitType:
 
 
 class Tile:
+    """Represents one map cell with terrain, optional unit, and custom data."""
+
     def __init__(self, q, r, terrain):
         self.q = q
         self.r = r
@@ -284,6 +314,8 @@ class Tile:
 
 
 class Unit:
+    """Mutable state for a unit instance (position, attributes)."""
+
     def __init__(self, unit_type, q, r):
         self.unit_type = unit_type
         self.q = q
@@ -299,6 +331,8 @@ class Unit:
 
 
 class HexStrategyGame:
+    """Main game controller: world generation, input, rendering bridge."""
+
     def __init__(self):
         self.terrain_types = {}
         self.unit_types = {}
@@ -319,6 +353,7 @@ class HexStrategyGame:
         self.time_accum = 0.0
 
     def initialize(self):
+        """Create terrain/unit registries, generate the hex map, prime C renderer."""
         os.makedirs(ASSET_DIR, exist_ok=True)
         self._bootstrap_types()
         self._load_textures()
@@ -337,6 +372,7 @@ class HexStrategyGame:
         self.sync_camera()
 
     def _bootstrap_types(self):
+        """Hydrate TerrainType/UnitType objects from static definitions."""
         for entry in TERRAIN_DEFS:
             terrain = TerrainType(
                 entry["name"],
@@ -360,12 +396,14 @@ class HexStrategyGame:
             self.unit_types[unit.name] = unit
 
     def _load_textures(self):
+        """Load every referenced texture (and placeholders) into hexlib slots."""
         for terrain in self.terrain_types.values():
             terrain.ensure_texture()
         for unit_type in self.unit_types.values():
             unit_type.ensure_texture()
 
     def _configure_hex_size(self):
+        """Set hex_size based on grass art so tiles align tightly."""
         base = self.terrain_types.get("grass")
         if base and base.pixel_width and base.pixel_height:
             effective_width = base.pixel_width * base.scale
@@ -378,6 +416,7 @@ class HexStrategyGame:
             self.hex_size = max(self.hex_size, 32.0)
 
     def sync_camera(self):
+        """Push the current camera state to C so rendering stays in sync."""
         lib.hl_set_camera(
             ctypes.c_float(self.camera_offset[0]),
             ctypes.c_float(self.camera_offset[1]),
@@ -385,10 +424,12 @@ class HexStrategyGame:
         )
 
     def update(self, dt):
+        """Advance any time-based animation counters."""
         if dt > 0.0:
             self.time_accum += dt
 
     def update_camera(self, dt):
+        """Apply WASD movement to the camera and clamp zoom range."""
         move_delta = 0.0
         if dt > 0.0:
             move_delta = self.pan_speed * dt / max(self.camera_zoom, 0.2)
@@ -406,6 +447,7 @@ class HexStrategyGame:
         self.sync_camera()
 
     def _build_world(self):
+        """Populate self.tiles with terrain based on simple heuristics."""
         rng = random_from_seed(42)
         radius = self.hex_radius
         grass = self.terrain_types["grass"]
@@ -429,6 +471,7 @@ class HexStrategyGame:
             self.tiles[(0, -1)].terrain = grass
 
     def _pick_terrain(self, q, r, radius, rng, grass, water, mountain):
+        """Very simple terrain generator that biases edges to mountains/water."""
         if r <= -3:
             return water
         if q + r > radius - 1:
@@ -443,12 +486,14 @@ class HexStrategyGame:
         return grass
 
     def _spawn_units(self):
+        """Drop initial units onto the map (currently just a single scout)."""
         scout_type = self.unit_types["scout"]
         unit = Unit(scout_type, 0, 0)
         self.units.append(unit)
         self.tiles[(0, 0)].unit = unit
 
     def handle_event(self, ev, q, r):
+        """Route events coming from C to Python helpers."""
         if ev == 1:
             self.running = False
         elif ev == 2:
@@ -494,7 +539,7 @@ class HexStrategyGame:
             self.hover_hex = None
 
     def _handle_key_down(self, key):
-        self.keys_down.add(key)
+        self.keys_down.add(key)  # tracked so update_camera knows which directions to apply
         if key in (SDLK_MINUS, SDLK_KP_MINUS):
             self.camera_zoom *= 0.9
         elif key in (SDLK_EQUALS, SDLK_KP_PLUS):
@@ -504,6 +549,7 @@ class HexStrategyGame:
         self.keys_down.discard(key)
 
     def _move_unit(self, unit, target_tile):
+        """Relocate a unit and recompute its reachable tiles."""
         origin_tile = self.tiles[(unit.q, unit.r)]
         origin_tile.unit = None
         unit.q, unit.r = target_tile.q, target_tile.r
@@ -511,6 +557,7 @@ class HexStrategyGame:
         self.reachable = self._compute_reachable(unit)
 
     def _compute_reachable(self, unit):
+        """Breadth-first search for all tiles reachable within move_range."""
         origin = (unit.q, unit.r)
         max_steps = unit.move_range
         visited = {origin}
@@ -531,26 +578,30 @@ class HexStrategyGame:
                     continue
                 visited.add((nq, nr))
                 reachable.add((nq, nr))
-                frontier.append(((nq, nr), dist + 1))
+                frontier.append(((nq, nr), dist + 1))  # enqueue for further exploration
         return reachable
 
     def push_tiles(self):
+        """Construct HL_TileInstance and debug label arrays for hexlib."""
         instances = []
         labels = []
-        tile_index = 0
+        tile_index = 0  # keeps iteration count if we need deterministic patterns later
         for (q, r), tile in self.tiles.items():
             terrain_slot = tile.terrain.slot if tile.terrain.loaded else -1
             unit_slot = tile.unit.texture_slot if tile.unit else -1
             terrain_scale = float(tile.terrain.scale if tile.terrain else 1.0)
             unit_scale = float(tile.unit.unit_type.scale if tile.unit else 1.0)
             overlay = self._overlay_for_tile(tile)
+
+            # Optional wobble/padding to help visualise offset behaviour.
             offset_x = 0.0
             offset_y = 0.0
             if tile.terrain.name == "water":
-                offset_y = math.sin(self.time_accum + q * 0.35 + r * 0.21) * 3.0
+                offset_y = math.sin(self.time_accum + q * 0.35 + r * 0.21) * 1.3
             elif (q + r) % 4 == 0:
-                offset_x = 2.0
+                offset_x = 0.0  # tweak this to slide every 4th tile horizontally
 
+            # Fill out the ctypes struct explicitly so every field is obvious.
             inst = HL_TileInstance()
             inst.q = q
             inst.r = r
@@ -562,7 +613,9 @@ class HexStrategyGame:
             inst.offset_x = offset_x
             inst.offset_y = offset_y
             instances.append(inst)
-            if tile_index % 5 == 0:
+
+            # Emit debug labels for tiles aligned on the 5-grid (helps spot drift).
+            if q % 5 == 0 or r % 5 == 0:
                 label_text = f"{q},{r}".encode("ascii", "replace")[:15]
                 label_struct = HL_DebugLabel()
                 label_struct.q = q
@@ -583,6 +636,7 @@ class HexStrategyGame:
             lib.hl_set_debug_labels(None, 0)
 
     def _overlay_for_tile(self, tile):
+        """Compute per-tile overlay colour (selection, reachable, hover)."""
         base = tile.terrain.base_overlay()
         coord = (tile.q, tile.r)
         if self.selected_unit and coord == (self.selected_unit.q, self.selected_unit.r):
@@ -595,6 +649,7 @@ class HexStrategyGame:
 
 
 def random_from_seed(seed):
+    """Simple LCG-based RNG so world generation is deterministic."""
     state = seed
 
     def _rnd():
@@ -606,6 +661,7 @@ def random_from_seed(seed):
 
 
 def main():
+    """Entry point: initialise hexlib, run the main loop, tear down cleanly."""
     if not lib.hl_init(WINDOW_WIDTH, WINDOW_HEIGHT, b"Hex Strategy Demo"):
         raise RuntimeError("Failed to initialize SDL2/hexlib")
 
@@ -616,6 +672,7 @@ def main():
 
     try:
         while game.running:
+            # Drain all pending input events before simulating the next frame.
             while True:
                 out_q = ctypes.c_int(0)
                 out_r = ctypes.c_int(0)
@@ -632,6 +689,7 @@ def main():
             game.update_camera(dt)
             game.push_tiles()
             lib.hl_step(ctypes.c_float(dt))
+            # Tiny sleep to keep CPU usage sane while still targeting ~60 FPS.
             time.sleep(0.004)
     finally:
         lib.hl_shutdown()
