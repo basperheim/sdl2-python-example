@@ -1,0 +1,34 @@
+cmake_minimum_required(VERSION 3.18)
+project(hexlib C)
+set(CMAKE_C_STANDARD 99)
+
+option(BUILD_DEMO "Build demo executable (main.c)" ON)
+
+find_package(PkgConfig QUIET)
+
+# Try pkg-config first: gives us an imported target with all flags (include, -L, -l, frameworks)
+if(PkgConfig_FOUND)
+  pkg_check_modules(SDL2 IMPORTED_TARGET sdl2)
+endif()
+
+add_library(hexlib SHARED src/hexlib.c)
+target_include_directories(hexlib PUBLIC ${PROJECT_SOURCE_DIR}/include)
+target_compile_definitions(hexlib PRIVATE HEXLIB_BUILD)
+
+if(TARGET PkgConfig::SDL2)
+  target_link_libraries(hexlib PRIVATE PkgConfig::SDL2)
+else()
+  # Fallback: SDL2's CMake package (Homebrew installs it under /opt/homebrew/lib/cmake/SDL2)
+  find_package(SDL2 CONFIG REQUIRED)
+  target_link_libraries(hexlib PRIVATE SDL2::SDL2)
+endif()
+
+if (BUILD_DEMO)
+  add_executable(hex_demo src/main.c)
+  target_include_directories(hex_demo PRIVATE ${PROJECT_SOURCE_DIR}/include)
+  if(TARGET PkgConfig::SDL2)
+    target_link_libraries(hex_demo PRIVATE hexlib PkgConfig::SDL2)
+  else()
+    target_link_libraries(hex_demo PRIVATE hexlib SDL2::SDL2)
+  endif()
+endif()
